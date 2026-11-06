@@ -1,0 +1,19 @@
+# An example for one rig. The task and its sub-task (PA) are set on the policy server (scripts/serve_policy.sh);
+# rig-specific here: server_host/port and the cameras.
+server_host: localhost
+server_port: 8000
+execute_rows: 0  # rows of each reply that play before the next request; 0: all of them
+tcp_offset_m: [0.088, 0.0, 0.0]  # the gripper tip in <side>_hand_root, the frame the policy's poses are in
+camera_latency_s: 0.12  # [s] from exposure to cv2 read: the observation is dated this much before the read
+max_step_mm: 40.0  # a first row beyond this refuses the chunk and pauses the run
+max_step_deg: 10.0
+# Between consecutive rows of a chunk, beyond which the chunk is refused and the run pauses: a guard against garbage
+# rows, not a speed limit; 100 mm / 30 deg per row is 2 m/s / 600 deg/s at 20 rows/s. Missing: no limit.
+max_row_step_mm: 100.0
+max_row_step_deg: 30.0
+publish_images: true  # JPEG on /<side>/<side>_arm_cam/image_raw/compressed, for bags
+# Rig-specific: these paths exist only on the original PC. Find yours with `v4l2-ctl --list-devices` and
+# `ls -l /dev/v4l/by-path` (by-path names stay fixed per USB port); the runner stops if one is missing.
+cameras:
+  left: {dev: "/dev/v4l/by-path/pci-0000:0e:00.0-usb-0:2.2:1.0-video-index0", width: 640, height: 480, fps: 30}
+  right: {dev: "/dev/v4l/by-path/pci-0000:0e:00.0-usb-0:2.1:1.0-video-index0", width: 640, height: 480, fps: 30}

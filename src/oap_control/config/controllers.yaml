@@ -1,0 +1,64 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 1000  # [Hz] the same on mock and on the real CAN buses
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    left_torque_controller:
+      type: oap_control/TorqueFeedforwardController
+    right_torque_controller:
+      type: oap_control/TorqueFeedforwardController
+    motion:
+      type: oap_control/Motion
+
+left_torque_controller:
+  ros__parameters:
+    joints: [openarm_left_joint1, openarm_left_joint2, openarm_left_joint3, openarm_left_joint4,
+             openarm_left_joint5, openarm_left_joint6, openarm_left_joint7]
+    mode: inverse_dynamics  # rnea(q, q̇_ref, q̈_ref): gravity, Coriolis and M·q̈
+    max_tau: [40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0]  # [Nm] motor torque limits
+    body_override:  # [kg], [m], [kg m²] in the joint frame: mass and com fitted with the gripper on, inertia of a box model
+      joint: openarm_left_joint7
+      mass: 0.598
+      com: [-0.0217, 0.0023, 0.0718]
+      inertia: [0.00191, 0.00198, 0.000565, 0.0, 0.0, 0.0]  # about the com: ixx iyy izz ixy ixz iyz
+    friction:  # [Nm], [rad/s]: static friction fitted on the reference rig
+      coulomb: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # with the integral below, 0 tracked better than the fitted values
+      static: [1.013, 0.936, 0.815, 0.749, 0.160, 0.210, 0.210]
+      stribeck_velocity: 0.025
+      transition_velocity: 0.001
+    integral:
+      gain: [130.0, 130.0, 130.0, 112.0, 40.0, 40.0, 40.0]  # [Nm/(rad s)]
+      limit: [4.0, 4.0, 2.7, 2.7, 0.7, 0.7, 0.7]  # [Nm] 10% of max_tau
+      band: 0.1  # [rad]
+      still_velocity: 0.001  # [rad/s] below it the integral holds, so a joint at rest does not step
+
+right_torque_controller:
+  ros__parameters:
+    joints: [openarm_right_joint1, openarm_right_joint2, openarm_right_joint3, openarm_right_joint4,
+             openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
+    mode: inverse_dynamics
+    max_tau: [40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0]
+    body_override:  # the left's, mirrored in y
+      joint: openarm_right_joint7
+      mass: 0.598
+      com: [-0.0217, -0.0023, 0.0718]
+      inertia: [0.00191, 0.00198, 0.000565, 0.0, 0.0, 0.0]
+    friction:  # the left's
+      coulomb: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      static: [1.013, 0.936, 0.815, 0.749, 0.160, 0.210, 0.210]
+      stribeck_velocity: 0.025
+      transition_velocity: 0.001
+    integral:  # the left's
+      gain: [130.0, 130.0, 130.0, 112.0, 40.0, 40.0, 40.0]
+      limit: [4.0, 4.0, 2.7, 2.7, 0.7, 0.7, 0.7]
+      band: 0.1
+      still_velocity: 0.001
+
+motion:
+  ros__parameters:
+    feedforward_controllers: [left_torque_controller, right_torque_controller]
+    max_joint_velocity: 2.513  # [rad/s] 2× 2π/5
+    max_joint_acceleration: 2.011  # [rad/s²] 2× 8π/25; at half of it the joints sat at the cap for most of a move
+    max_joint_lead: 0.15  # [rad] standing PD error reaches ~0.09 rad
+    ik_damping: 0.02  # damped least squares λ
+    limit_margin: 0.02  # [rad] kept inside the URDF position limits

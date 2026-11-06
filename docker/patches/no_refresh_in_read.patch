@@ -1,0 +1,18 @@
+diff --git a/openarm_hardware/src/v10_simple_hardware.cpp b/openarm_hardware/src/v10_simple_hardware.cpp
+index fdce9dd..e5bf67f 100644
+--- a/openarm_hardware/src/v10_simple_hardware.cpp
++++ b/openarm_hardware/src/v10_simple_hardware.cpp
+@@ -497,9 +497,10 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_deactivate(
+ 
+ hardware_interface::return_type OpenArm_v10HW::read(
+     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+-  // Receive all motor states
+-  openarm_->refresh_all();
+-  openarm_->recv_all();
++  // AIRoA: no refresh round here. Every MIT command in write() makes the motor
++  // reply with a state frame, which write()'s recv_all() parses into the motor
++  // objects; read() only copies them out. The extra refresh doubled the bus to
++  // ~84% load at 500 Hz and the motors stopped acting on commands.
+ 
+   // Read arm joint states
+   const auto& arm_motors = openarm_->get_arm().get_motors();

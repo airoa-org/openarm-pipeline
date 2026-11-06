@@ -1,0 +1,3 @@
+# SC1091: the sourced ROS setup files live in the image, not in the repo.
+# SC2155: scripts/serve_policy.sh exports a value from $(basename ...); remove once it declares and assigns separately.
+disable=SC1091,SC2155

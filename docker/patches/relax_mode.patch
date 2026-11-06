@@ -1,0 +1,220 @@
+diff --git a/openarm_hardware/CMakeLists.txt b/openarm_hardware/CMakeLists.txt
+index 1ed4692..910d77c 100644
+--- a/openarm_hardware/CMakeLists.txt
++++ b/openarm_hardware/CMakeLists.txt
+@@ -25,6 +25,7 @@ find_package(hardware_interface REQUIRED)
+ find_package(pluginlib REQUIRED)
+ find_package(rclcpp REQUIRED)
+ find_package(rclcpp_lifecycle REQUIRED)
++find_package(std_srvs REQUIRED)
+ 
+ # Find openarm_can library
+ find_package(OpenArmCAN REQUIRED)
+@@ -48,6 +49,7 @@ ament_target_dependencies(${PROJECT_NAME}
+   pluginlib
+   rclcpp
+   rclcpp_lifecycle
++  std_srvs
+ )
+ 
+ pluginlib_export_plugin_description_file(hardware_interface openarm_hardware.xml)
+diff --git a/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp b/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
+index adcf4d9..6fe6335 100644
+--- a/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
+@@ -14,6 +14,8 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <atomic>
+ #include <chrono>
+ #include <memory>
+ #include <openarm/can/socket/openarm.hpp>
+@@ -30,6 +32,7 @@
+ #include "rclcpp/macros.hpp"
+ #include "rclcpp/rclcpp.hpp"
+ #include "rclcpp_lifecycle/state.hpp"
++#include "std_srvs/srv/set_bool.hpp"
+ 
+ namespace openarm_hardware {
+ 
+@@ -141,6 +144,16 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
+   std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> ros_exec_;
+   std::thread ros_spin_thread_;
+ 
++  // --- AIRoA: relax mode: no position tracking, damping kept ----------------
++  void start_relax();
++  static constexpr double RELAX_MAX_KD = 5.0;  // the MIT frame's kd range
++  std::atomic<bool> relax_mode_{false};
++  bool was_relaxed_ = false;  // touched only by write()
++  std::array<std::atomic<double>, ARM_DOF> relax_kd_;
++  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr relax_srv_;
++  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
++      relax_param_cb_;
++
+   // Helper methods
+   void return_to_zero();
+   bool parse_config(const hardware_interface::HardwareInfo& info);
+diff --git a/openarm_hardware/package.xml b/openarm_hardware/package.xml
+index 0a89278..993098b 100644
+--- a/openarm_hardware/package.xml
++++ b/openarm_hardware/package.xml
+@@ -28,6 +28,7 @@
+   <depend>hardware_interface</depend>
+   <depend>openarm_can</depend>
+   <depend>pluginlib</depend>
++  <depend>std_srvs</depend>
+ 
+   <test_depend>ament_lint_auto</test_depend>
+   <test_depend>ament_lint_common</test_depend>
+diff --git a/openarm_hardware/src/v10_simple_hardware.cpp b/openarm_hardware/src/v10_simple_hardware.cpp
+index a5c246a..52a3e58 100644
+--- a/openarm_hardware/src/v10_simple_hardware.cpp
++++ b/openarm_hardware/src/v10_simple_hardware.cpp
+@@ -63,16 +63,38 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
+     can_fd_ = (value == "true");
+   }
+ 
+-  // Parse control gains
++  // Parse control gains (AIRoA: a malformed value fails on_init, not throws)
+   for (size_t i = 1; i <= ARM_DOF; ++i) {
+-    it = info.hardware_parameters.find("kp" + std::to_string(i));
+-    if (it != info.hardware_parameters.end()) {
+-      kp_[i - 1] = std::stod(it->second);
++    for (const char* name : {"kp", "kd"}) {
++      it = info.hardware_parameters.find(name + std::to_string(i));
++      if (it == info.hardware_parameters.end()) {
++        continue;
++      }
++      size_t n = 0;  // characters parsed: trailing junk fails too
++      try {
++        (name[1] == 'p' ? kp_ : kd_)[i - 1] = std::stod(it->second, &n);
++      } catch (const std::exception&) {
++        n = 0;
++      }
++      if (n == 0 || n != it->second.size()) {
++        RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
++                     "%s%zu='%s' is not a number", name, i,
++                     it->second.c_str());
++        return false;
++      }
+     }
+-    it = info.hardware_parameters.find("kd" + std::to_string(i));
+-    if (it != info.hardware_parameters.end()) {
+-      kd_[i - 1] = std::stod(it->second);
++  }
++
++  // AIRoA: relax damps with the startup kd; twice that buzzed on the table.
++  // Checked here, as relax_kd's parameter callback would check it: a value it
++  // rejects makes declare_parameter() throw inside on_configure.
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    if (!(kd_[i] > 0.0)) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
++                   "kd%zu=%f: relax needs kd > 0", i + 1, kd_[i]);
++      return false;
+     }
++    relax_kd_[i].store(std::min(kd_[i], RELAX_MAX_KD));
+   }
+ 
+   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+@@ -96,6 +118,7 @@ void OpenArm_v10HW::start_ros_node() {
+     tag = "single";
+   }
+   ros_node_ = std::make_shared<rclcpp::Node>("openarm_hw_relax_" + tag);
++  start_relax();
+   ros_exec_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+   ros_exec_->add_node(ros_node_);
+   ros_spin_thread_ = std::thread([this]() { ros_exec_->spin(); });
+@@ -108,10 +131,68 @@ void OpenArm_v10HW::stop_ros_node() {
+   if (ros_spin_thread_.joinable()) {
+     ros_spin_thread_.join();
+   }
++  relax_srv_.reset();
+   ros_node_.reset();
+   ros_exec_.reset();
+ }
+ 
++// AIRoA
++void OpenArm_v10HW::start_relax() {
++  relax_srv_ = ros_node_->create_service<std_srvs::srv::SetBool>(
++      "~/set_relax",
++      [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> req,
++             std::shared_ptr<std_srvs::srv::SetBool::Response> res) {
++        if (req->data) {
++          relax_mode_.store(true);
++          res->message = "relax ON: Kp=0, arm sinks under gravity (damped)";
++        } else {
++          // write() goes back to tracking pos_commands_, which the torque
++          // controller sets every cycle from motion's command. Callers
++          // (oap_planner, oap_gui) call /arm/hold before and after this so
++          // that command is the measured pose. write() itself puts
++          // pos_commands_ on the measured pose on the first cycle out of
++          // relax (this thread does not touch it), which holds the arm when
++          // no controller writes pos_commands_.
++          relax_mode_.store(false);
++          res->message = "relax OFF: tracking the commanded pose";
++        }
++        res->success = true;
++        RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"), "%s",
++                    res->message.c_str());
++      });
++  relax_param_cb_ = ros_node_->add_on_set_parameters_callback(
++      [this](const std::vector<rclcpp::Parameter>& params) {
++        rcl_interfaces::msg::SetParametersResult result;
++        result.successful = true;
++        for (const auto& p : params) {
++          if (p.get_name() != "relax_kd") {
++            continue;
++          }
++          const std::vector<double> v = p.as_double_array();
++          bool ok = v.size() == ARM_DOF;
++          for (size_t i = 0; ok && i < ARM_DOF; ++i) {
++            ok = v[i] > 0.0 && v[i] <= RELAX_MAX_KD;
++          }
++          if (!ok) {
++            result.successful = false;
++            result.reason = "relax_kd needs 7 values in (0, 5]";
++            break;
++          }
++          for (size_t i = 0; i < ARM_DOF; ++i) {
++            relax_kd_[i].store(v[i]);
++          }
++        }
++        return result;
++      });
++  std::vector<double> kd0(ARM_DOF);
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    kd0[i] = relax_kd_[i].load();
++  }
++  ros_node_->declare_parameter("relax_kd", kd0);
++  RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
++              "relax service ready: /%s/set_relax", ros_node_->get_name());
++}
++
+ void OpenArm_v10HW::generate_joint_names() {
+   joint_names_.clear();
+   // TODO: read from urdf properly and sort in the future.
+@@ -306,9 +387,20 @@ hardware_interface::return_type OpenArm_v10HW::write(
+     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+   // Control arm motors with MIT control
+   std::vector<openarm::damiao_motor::MITParam> arm_params;
++  const bool relax = relax_mode_.load();  // AIRoA
++  if (!relax && was_relaxed_) {           // AIRoA: leaving relax, see start_relax()
++    for (size_t i = 0; i < ARM_DOF; ++i) {
++      pos_commands_[i] = pos_states_[i];
++    }
++  }
++  was_relaxed_ = relax;
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+-    arm_params.push_back(
+-        {kp_[i], kd_[i], pos_commands_[i], vel_commands_[i], tau_commands_[i]});
++    if (relax) {
++      arm_params.push_back({0.0, relax_kd_[i].load(), pos_states_[i], 0.0, 0.0});
++    } else {
++      arm_params.push_back({kp_[i], kd_[i], pos_commands_[i],
++                            vel_commands_[i], tau_commands_[i]});
++    }
+   }
+   openarm_->get_arm().mit_control_all(arm_params);
+   // Control gripper if enabled

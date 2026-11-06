@@ -1,0 +1,289 @@
+diff --git a/openarm_hardware/CMakeLists.txt b/openarm_hardware/CMakeLists.txt
+index 910d77c..8c48574 100644
+--- a/openarm_hardware/CMakeLists.txt
++++ b/openarm_hardware/CMakeLists.txt
+@@ -26,6 +26,7 @@ find_package(pluginlib REQUIRED)
+ find_package(rclcpp REQUIRED)
+ find_package(rclcpp_lifecycle REQUIRED)
+ find_package(std_srvs REQUIRED)
++find_package(std_msgs REQUIRED)
+ 
+ # Find openarm_can library
+ find_package(OpenArmCAN REQUIRED)
+@@ -50,6 +51,7 @@ ament_target_dependencies(${PROJECT_NAME}
+   rclcpp
+   rclcpp_lifecycle
+   std_srvs
++  std_msgs
+ )
+ 
+ pluginlib_export_plugin_description_file(hardware_interface openarm_hardware.xml)
+diff --git a/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp b/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
+index 6fe6335..ee1216c 100644
+--- a/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
+@@ -32,6 +32,7 @@
+ #include "rclcpp/macros.hpp"
+ #include "rclcpp/rclcpp.hpp"
+ #include "rclcpp_lifecycle/state.hpp"
++#include "std_msgs/msg/float64_multi_array.hpp"
+ #include "std_srvs/srv/set_bool.hpp"
+ 
+ namespace openarm_hardware {
+@@ -154,6 +155,31 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
+   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
+       relax_param_cb_;
+ 
++  // --- AIRoA: live per-joint kp/kd, ramped over gain_ramp_s ----------------
++  void start_live_gains();
++  bool set_gains(const rclcpp::Parameter& p,
++                 rcl_interfaces::msg::SetParametersResult& result);
++  void step_gain_ramp(double dt);
++  static constexpr double MAX_KP = 200.0;  // engineering judgment; wire range 500
++  static constexpr double MAX_KD = 4.5;    // 10% under the 5.0 wire clamp
++  std::array<std::atomic<double>, ARM_DOF> kp_target_;
++  std::array<std::atomic<double>, ARM_DOF> kd_target_;
++  std::atomic<uint64_t> gains_gen_{0};  // bumped after each target change
++  std::atomic<double> gain_ramp_s_{1.0};
++  // Manual: kp ramps to 0 (and back) over gain_ramp_s; kd and the effort command stay. Bump gains_gen_ on a change.
++  std::atomic<bool> manual_{false};
++  void set_manual(bool on);
++  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr manual_srv_;
++  // Touched only by write().
++  uint64_t gains_gen_seen_ = 0;
++  double ramp_t_ = 0.0;
++  std::vector<double> kp_from_, kd_from_, kp_to_, kd_to_, kp_now_, kd_now_;
++  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
++      live_gains_param_cb_;
++  // [kp1..kp7, kd1..kd7] targets; latched and repeated at 1 Hz so bags carry them.
++  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr gains_pub_;
++  rclcpp::TimerBase::SharedPtr gains_timer_;
++
+   // Helper methods
+   void return_to_zero();
+   bool parse_config(const hardware_interface::HardwareInfo& info);
+diff --git a/openarm_hardware/package.xml b/openarm_hardware/package.xml
+index 993098b..b7eb8c7 100644
+--- a/openarm_hardware/package.xml
++++ b/openarm_hardware/package.xml
+@@ -29,6 +29,7 @@
+   <depend>openarm_can</depend>
+   <depend>pluginlib</depend>
+   <depend>std_srvs</depend>
++  <depend>std_msgs</depend>
+ 
+   <test_depend>ament_lint_auto</test_depend>
+   <test_depend>ament_lint_common</test_depend>
+diff --git a/openarm_hardware/src/v10_simple_hardware.cpp b/openarm_hardware/src/v10_simple_hardware.cpp
+index 52a3e58..fdce9dd 100644
+--- a/openarm_hardware/src/v10_simple_hardware.cpp
++++ b/openarm_hardware/src/v10_simple_hardware.cpp
+@@ -85,6 +85,23 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
+     }
+   }
+ 
++  // AIRoA: live gains start at the kp<i>/kd<i> hardware parameters. Checked
++  // here against set_gains()'s limits: a value it rejects makes
++  // declare_parameter() throw inside on_configure.
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    if (!(kp_[i] >= 0.0 && kp_[i] <= MAX_KP) ||
++        !(kd_[i] >= 0.0 && kd_[i] <= MAX_KD)) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
++                   "kp%zu=%f kd%zu=%f: needs kp in 0..%.1f, kd in 0..%.1f",
++                   i + 1, kp_[i], i + 1, kd_[i], MAX_KP, MAX_KD);
++      return false;
++    }
++    kp_target_[i].store(kp_[i]);
++    kd_target_[i].store(kd_[i]);
++  }
++  kp_from_ = kp_to_ = kp_now_ = kp_;
++  kd_from_ = kd_to_ = kd_now_ = kd_;
++
+   // AIRoA: relax damps with the startup kd; twice that buzzed on the table.
+   // Checked here, as relax_kd's parameter callback would check it: a value it
+   // rejects makes declare_parameter() throw inside on_configure.
+@@ -119,6 +136,7 @@ void OpenArm_v10HW::start_ros_node() {
+   }
+   ros_node_ = std::make_shared<rclcpp::Node>("openarm_hw_relax_" + tag);
+   start_relax();
++  start_live_gains();
+   ros_exec_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+   ros_exec_->add_node(ros_node_);
+   ros_spin_thread_ = std::thread([this]() { ros_exec_->spin(); });
+@@ -131,6 +149,9 @@ void OpenArm_v10HW::stop_ros_node() {
+   if (ros_spin_thread_.joinable()) {
+     ros_spin_thread_.join();
+   }
++  gains_timer_.reset();
++  manual_srv_.reset();
++  gains_pub_.reset();
+   relax_srv_.reset();
+   ros_node_.reset();
+   ros_exec_.reset();
+@@ -143,6 +164,7 @@ void OpenArm_v10HW::start_relax() {
+       [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> req,
+              std::shared_ptr<std_srvs::srv::SetBool::Response> res) {
+         if (req->data) {
++          set_manual(false);
+           relax_mode_.store(true);
+           res->message = "relax ON: Kp=0, arm sinks under gravity (damped)";
+         } else {
+@@ -154,6 +176,7 @@ void OpenArm_v10HW::start_relax() {
+           // relax (this thread does not touch it), which holds the arm when
+           // no controller writes pos_commands_.
+           relax_mode_.store(false);
++          set_manual(false);
+           res->message = "relax OFF: tracking the commanded pose";
+         }
+         res->success = true;
+@@ -193,6 +216,127 @@ void OpenArm_v10HW::start_relax() {
+               "relax service ready: /%s/set_relax", ros_node_->get_name());
+ }
+ 
++// AIRoA
++void OpenArm_v10HW::start_live_gains() {
++  live_gains_param_cb_ = ros_node_->add_on_set_parameters_callback(
++      [this](const std::vector<rclcpp::Parameter>& params) {
++        rcl_interfaces::msg::SetParametersResult result;
++        result.successful = true;
++        for (const auto& p : params) {
++          if (p.get_name() == "gain_ramp_s") {
++            const double v = p.as_double();
++            if (v < 0.05 || v > 10.0) {
++              result.successful = false;
++              result.reason = "gain_ramp_s must be in [0.05, 10]";
++            } else {
++              gain_ramp_s_.store(v);
++            }
++          } else if (!set_gains(p, result)) {
++            break;
++          }
++        }
++        return result;
++      });
++  ros_node_->declare_parameter("kp_joints", kp_);
++  ros_node_->declare_parameter("kd_joints", kd_);
++  ros_node_->declare_parameter("gain_ramp_s", gain_ramp_s_.load());
++  // Manual, to move the arm by hand: the torque controller's effort command is gravity while motion holds.
++  manual_srv_ = ros_node_->create_service<std_srvs::srv::SetBool>(
++      "~/set_manual",
++      [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> req,
++             std::shared_ptr<std_srvs::srv::SetBool::Response> res) {
++        set_manual(req->data);
++        res->success = true;
++        res->message = req->data ? "manual ON: kp ramps to 0, damping and gravity kept"
++                                 : "manual OFF: kp ramps back";
++        RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"), "%s",
++                    res->message.c_str());
++      });
++  gains_pub_ = ros_node_->create_publisher<std_msgs::msg::Float64MultiArray>(
++      "~/gains", rclcpp::QoS(1).transient_local());
++  gains_timer_ = ros_node_->create_wall_timer(
++      std::chrono::seconds(1), [this]() {
++        std_msgs::msg::Float64MultiArray msg;
++        msg.layout.dim.resize(2);
++        msg.layout.dim[0].label = "kp";
++        msg.layout.dim[0].size = ARM_DOF;
++        msg.layout.dim[0].stride = ARM_DOF;
++        msg.layout.dim[1].label = "kd";
++        msg.layout.dim[1].size = ARM_DOF;
++        msg.layout.dim[1].stride = ARM_DOF;
++        for (size_t i = 0; i < ARM_DOF; ++i) {
++          msg.data.push_back(kp_target_[i].load());
++        }
++        for (size_t i = 0; i < ARM_DOF; ++i) {
++          msg.data.push_back(kd_target_[i].load());
++        }
++        gains_pub_->publish(msg);
++      });
++}
++
++// AIRoA: rejects rather than clamps, because the MIT frame clamps silently.
++bool OpenArm_v10HW::set_gains(
++    const rclcpp::Parameter& p,
++    rcl_interfaces::msg::SetParametersResult& result) {
++  const std::string& name = p.get_name();
++  const bool is_kp = name == "kp_joints";
++  if (!is_kp && name != "kd_joints") {
++    return true;
++  }
++  const std::vector<double> g = p.as_double_array();
++  if (g.size() != ARM_DOF) {
++    result.successful = false;
++    result.reason = name + " needs " + std::to_string(ARM_DOF) + " values";
++    return false;
++  }
++  const double limit = is_kp ? MAX_KP : MAX_KD;
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    if (!(g[i] >= 0.0) || g[i] > limit) {
++      result.successful = false;
++      result.reason = name + "[" + std::to_string(i) + "]=" +
++                      std::to_string(g[i]) + " outside 0.." +
++                      std::to_string(limit);
++      return false;
++    }
++  }
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    (is_kp ? kp_target_ : kd_target_)[i].store(g[i]);
++  }
++  gains_gen_.fetch_add(1);
++  RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
++              "%s = [%.2f %.2f %.2f %.2f %.2f %.2f %.2f] (ramping over %.2fs)",
++              name.c_str(), g[0], g[1], g[2], g[3], g[4], g[5], g[6],
++              gain_ramp_s_.load());
++  return true;
++}
++
++// AIRoA: changing the gains at once could cause abrupt motion, so ramp them.
++void OpenArm_v10HW::set_manual(bool on) {
++  if (manual_.exchange(on) != on) {
++    gains_gen_.fetch_add(1);
++  }
++}
++
++void OpenArm_v10HW::step_gain_ramp(double dt) {
++  const uint64_t gen = gains_gen_.load();
++  if (gen != gains_gen_seen_) {
++    gains_gen_seen_ = gen;
++    kp_from_ = kp_now_;
++    kd_from_ = kd_now_;
++    for (size_t i = 0; i < ARM_DOF; ++i) {
++      kp_to_[i] = manual_.load() ? 0.0 : kp_target_[i].load();
++      kd_to_[i] = kd_target_[i].load();
++    }
++    ramp_t_ = 0.0;
++  }
++  ramp_t_ += std::max(dt, 0.0);
++  const double a = std::min(1.0, ramp_t_ / gain_ramp_s_.load());
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    kp_now_[i] = kp_from_[i] + a * (kp_to_[i] - kp_from_[i]);
++    kd_now_[i] = kd_from_[i] + a * (kd_to_[i] - kd_from_[i]);
++  }
++}
++
+ void OpenArm_v10HW::generate_joint_names() {
+   joint_names_.clear();
+   // TODO: read from urdf properly and sort in the future.
+@@ -384,7 +528,7 @@ hardware_interface::return_type OpenArm_v10HW::read(
+ }
+ 
+ hardware_interface::return_type OpenArm_v10HW::write(
+-    const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
++    const rclcpp::Time& /*time*/, const rclcpp::Duration& period) {
+   // Control arm motors with MIT control
+   std::vector<openarm::damiao_motor::MITParam> arm_params;
+   const bool relax = relax_mode_.load();  // AIRoA
+@@ -394,11 +538,12 @@ hardware_interface::return_type OpenArm_v10HW::write(
+     }
+   }
+   was_relaxed_ = relax;
++  step_gain_ramp(period.seconds());       // AIRoA
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+     if (relax) {
+       arm_params.push_back({0.0, relax_kd_[i].load(), pos_states_[i], 0.0, 0.0});
+     } else {
+-      arm_params.push_back({kp_[i], kd_[i], pos_commands_[i],
++      arm_params.push_back({kp_now_[i], kd_now_[i], pos_commands_[i],
+                             vel_commands_[i], tau_commands_[i]});
+     }
+   }

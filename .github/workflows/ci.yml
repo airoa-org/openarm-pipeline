@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Lint only. The build and the tests need the image (pinocchio compiles from source: hours on a hosted runner), so they
+# run locally: ./scripts/oap test (README, Tests).
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: ruff
+        run: pipx run ruff==0.17.3 check --output-format=github .
+      - name: shellcheck
+        # every bash script in scripts/ (some have no extension) and the image's entrypoint; config: .shellcheckrc
+        run: |
+          mapfile -t files < <(grep -lE '^#!.*\b(ba)?sh\b' scripts/* docker/*.sh)
+          printf '%s\n' "${files[@]}"
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0 "${files[@]}"

@@ -1,0 +1,20 @@
+# Lint for the Python packages and tests. Run: ruff check .
+line-length = 120
+target-version = "py310"  # the ROS 2 Humble image's Python
+
+[lint]
+# pycodestyle errors and warnings, pyflakes, bugbear
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E731",  # a named lambda reads fine for one-line helpers
+    "B905",  # zip(strict=...): the zipped sequences here are built to the same length
+]
+
+[lint.per-file-ignores]
+# Code that predates this config; drop an entry once its file is cleaned up.
+"src/oap_control/launch/robot.launch.py" = ["E501"]
+"src/oap_planner/oap_planner/circle.py" = ["E501"]
+"src/oap_planner/oap_planner/plan.py" = ["E501"]
+"src/oap_runner/oap_runner/prewarm.py" = ["E501"]
+"src/oap_runner/oap_runner/runner.py" = ["E501"]
+"src/oap_planner/oap_planner/geometry.py" = ["B023", "E741", "F841", "W291"]

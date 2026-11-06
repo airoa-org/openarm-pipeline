@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>oap_gripper</name>
+  <version>0.1.0</version>
+  <description>Both YUBI fingers on one Dynamixel bus, through the ROBOTIS dynamixel_sdk</description>
+  <maintainer email="ext-oss@airoa.org">AIRoA</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>dynamixel_sdk</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

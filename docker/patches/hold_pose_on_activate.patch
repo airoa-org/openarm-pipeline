@@ -1,0 +1,312 @@
+diff --git a/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp b/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
+index ee1216c..e9406ee 100644
+--- a/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
+@@ -73,6 +73,15 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
+   hardware_interface::CallbackReturn on_deactivate(
+       const rclcpp_lifecycle::State& previous_state) override;
+ 
++  // AIRoA: both disable the motors as a last resort
++  TEMPLATES__ROS2_CONTROL__VISIBILITY_PUBLIC
++  hardware_interface::CallbackReturn on_shutdown(
++      const rclcpp_lifecycle::State& previous_state) override;
++
++  TEMPLATES__ROS2_CONTROL__VISIBILITY_PUBLIC
++  hardware_interface::CallbackReturn on_error(
++      const rclcpp_lifecycle::State& previous_state) override;
++
+   TEMPLATES__ROS2_CONTROL__VISIBILITY_PUBLIC
+   hardware_interface::return_type read(const rclcpp::Time& time,
+                                        const rclcpp::Duration& period) override;
+@@ -181,7 +190,14 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
+   rclcpp::TimerBase::SharedPtr gains_timer_;
+ 
+   // Helper methods
+-  void return_to_zero();
++  // AIRoA: false when an arm motor has sent no state since `replies` was taken
++  bool return_to_zero(const std::array<int64_t, ARM_DOF>& replies);
++  int64_t state_replies(size_t i);
++  // AIRoA: false when an arm motor does not answer while still disabled
++  bool check_presence();
++  // AIRoA: disable the motors if they may be enabled; safe to call twice
++  void disable_motors();
++  bool motors_enabled_ = false;  // set before enable_all(), cleared on disable
+   bool parse_config(const hardware_interface::HardwareInfo& info);
+   void generate_joint_names();
+ 
+diff --git a/openarm_hardware/src/v10_simple_hardware.cpp b/openarm_hardware/src/v10_simple_hardware.cpp
+index e5bf67f..0b34117 100644
+--- a/openarm_hardware/src/v10_simple_hardware.cpp
++++ b/openarm_hardware/src/v10_simple_hardware.cpp
+@@ -29,7 +29,10 @@ namespace openarm_hardware {
+ OpenArm_v10HW::OpenArm_v10HW() = default;
+ 
+ // AIRoA
+-OpenArm_v10HW::~OpenArm_v10HW() { stop_ros_node(); }
++OpenArm_v10HW::~OpenArm_v10HW() {
++  disable_motors();  // last resort, see on_shutdown()
++  stop_ros_node();
++}
+ 
+ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
+   // Parse CAN interface (default: can0)
+@@ -406,6 +409,11 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_init(
+                                  DEFAULT_GRIPPER_RECV_CAN_ID);
+   }
+ 
++  // AIRoA: see check_presence()
++  if (!check_presence()) {
++    return CallbackReturn::ERROR;
++  }
++
+   // Initialize state and command vectors based on generated joint count
+   const size_t total_joints = joint_names_.size();
+   pos_commands_.resize(total_joints, 0.0);
+@@ -469,13 +477,22 @@ OpenArm_v10HW::export_command_interfaces() {
+ hardware_interface::CallbackReturn OpenArm_v10HW::on_activate(
+     const rclcpp_lifecycle::State& /*previous_state*/) {
+   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"), "Activating OpenArm V10...");
++  // AIRoA: count each arm motor's state replies from here (return_to_zero())
++  std::array<int64_t, ARM_DOF> replies{};
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    replies[i] = state_replies(i);
++  }
+   openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
++  motors_enabled_ = true;  // AIRoA
+   openarm_->enable_all();
+   std::this_thread::sleep_for(std::chrono::milliseconds(100));
+   openarm_->recv_all();
+ 
+-  // Return to zero position
+-  return_to_zero();
++  // AIRoA: hold the measured pose; refuse to activate without one
++  if (!return_to_zero(replies)) {
++    disable_motors();
++    return CallbackReturn::ERROR;
++  }
+ 
+   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"), "OpenArm V10 activated");
+   return CallbackReturn::SUCCESS;
+@@ -487,14 +504,138 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_deactivate(
+               "Deactivating OpenArm V10...");
+ 
+   // Disable all motors (like full_arm.cpp exit)
+-  openarm_->disable_all();
+-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+-  openarm_->recv_all();
++  motors_enabled_ = true;  // AIRoA: always send the disable here
++  disable_motors();
+ 
+   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"), "OpenArm V10 deactivated");
+   return CallbackReturn::SUCCESS;
+ }
+ 
++// AIRoA: ros2_control calls on_shutdown at a normal exit (after on_deactivate
++// for an active arm) and on_error when a transition fails. Neither runs, and
++// neither does the destructor, when ros2_control_node dies on an uncaught
++// exception (e.g. the controller manager failing to activate the other arm):
++// check_presence() exists so that a missing motor fails before any arm is
++// enabled.
++hardware_interface::CallbackReturn OpenArm_v10HW::on_shutdown(
++    const rclcpp_lifecycle::State& /*previous_state*/) {
++  disable_motors();
++  return CallbackReturn::SUCCESS;
++}
++
++hardware_interface::CallbackReturn OpenArm_v10HW::on_error(
++    const rclcpp_lifecycle::State& /*previous_state*/) {
++  disable_motors();
++  return CallbackReturn::SUCCESS;
++}
++
++void OpenArm_v10HW::disable_motors() {
++  if (!openarm_ || !motors_enabled_) {
++    return;
++  }
++  motors_enabled_ = false;
++  // Confirmed when every arm motor has sent a state since the disable went out
++  // and that state reports it disabled (the status nibble of the frame).
++  // openarm_can never throws on a failed write, it only counts it, so a lost
++  // frame shows up as no confirmation: send the disable again, up to 3 times.
++  const auto write_failures = [this]() {
++    const auto& bus = openarm_->get_bus_status();
++    return bus.write_net_down.count + bus.write_no_buffer.count +
++           bus.write_other.count;
++  };
++  const uint64_t failures0 = write_failures();
++  std::array<bool, ARM_DOF> off{};
++  bool all_off = false;
++  int attempts = 0;
++  try {  // nothing may throw out of the destructor
++    openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
++    while (!all_off && attempts < 3) {
++      ++attempts;
++      std::array<int64_t, ARM_DOF> before{};
++      for (size_t i = 0; i < ARM_DOF; ++i) {
++        before[i] = state_replies(i);
++      }
++      openarm_->disable_all();
++      const auto deadline =
++          std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
++      while (!all_off && std::chrono::steady_clock::now() < deadline) {
++        openarm_->recv_all(500);
++        const auto& motors = openarm_->get_arm().get_motors();
++        all_off = true;
++        for (size_t i = 0; i < ARM_DOF && i < motors.size(); ++i) {
++          off[i] = off[i] ||
++                   (state_replies(i) > before[i] && !motors[i].is_enabled());
++          all_off = all_off && off[i];
++        }
++      }
++    }
++  } catch (const std::exception& e) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
++                 "[link %s] disabling the motors: %s", can_interface_.c_str(),
++                 e.what());
++  }
++  const uint64_t failed_writes = write_failures() - failures0;
++  if (all_off && failed_writes == 0) {
++    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
++                "[link %s] motors disabled (confirmed)", can_interface_.c_str());
++    return;
++  }
++  std::string missing;
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    if (!off[i]) {
++      missing += " j" + std::to_string(i + 1);
++    }
++  }
++  RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
++               "[link %s] disable sent %d time(s), %llu CAN write(s) failed; "
++               "not confirmed disabled:%s -- check the arm, e-stop if needed",
++               can_interface_.c_str(), attempts,
++               static_cast<unsigned long long>(failed_writes),
++               missing.empty() ? " (none)" : missing.c_str());
++}
++
++// AIRoA: ros2_control initializes every hardware component before it
++// configures and activates them one by one, and a component that fails here
++// leaves its interfaces missing, so the controller manager stops before
++// enabling either arm. Each motor is asked for a parameter (its master ID)
++// while still disabled -- openarm_can's own `discover` command finds motors
++// the same way -- and every reply routed to it counts in its link stats.
++bool OpenArm_v10HW::check_presence() {
++  std::array<uint64_t, ARM_DOF> before{};
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    before[i] =
++        openarm_->get_arm().get_link_stats(static_cast<int>(i)).responses;
++  }
++  openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::PARAM);
++  bool all = false;
++  for (int attempt = 0; attempt < 3 && !all; ++attempt) {
++    openarm_->get_arm().query_param_all(
++        static_cast<int>(openarm::damiao_motor::RID::MST_ID));
++    const auto deadline =
++        std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
++    while (!all && std::chrono::steady_clock::now() < deadline) {
++      openarm_->recv_all(500);
++      all = true;
++      for (size_t i = 0; i < ARM_DOF; ++i) {
++        all = all && openarm_->get_arm()
++                             .get_link_stats(static_cast<int>(i))
++                             .responses > before[i];
++      }
++    }
++  }
++  openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    if (openarm_->get_arm().get_link_stats(static_cast<int>(i)).responses ==
++        before[i]) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
++                   "[link %s] joint %zu did not answer a parameter query: not "
++                   "starting (check its power, CAN ID and wiring)",
++                   can_interface_.c_str(), i + 1);
++    }
++  }
++  return all;
++}
++
+ hardware_interface::return_type OpenArm_v10HW::read(
+     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+   // AIRoA: no refresh round here. Every MIT command in write() makes the motor
+@@ -560,14 +701,68 @@ hardware_interface::return_type OpenArm_v10HW::write(
+   return hardware_interface::return_type::OK;
+ }
+ 
+-void OpenArm_v10HW::return_to_zero() {
++// AIRoA: replies to arm motor i that carried a state it could parse. The
++// library counts every frame routed to a motor as a response before parsing
++// it, and a frame that fails the parse also as malformed: such a reply leaves
++// get_position() where it was (0.0 if the motor never sent a state). On classic
++// CAN a frame shorter than 8 bytes is counted as neither; the rig uses CAN-FD.
++int64_t OpenArm_v10HW::state_replies(size_t i) {
++  const auto& s = openarm_->get_arm().get_link_stats(static_cast<int>(i));
++  return static_cast<int64_t>(s.responses) -
++         static_cast<int64_t>(s.malformed_frames);
++}
++
++bool OpenArm_v10HW::return_to_zero(
++    const std::array<int64_t, ARM_DOF>& replies) {
++  // AIRoA: hold the CURRENT pose instead of driving every joint to zero.
++  // Upstream sent p_des=0 here, so an arm restarted away from zero was yanked
++  // there at full kp -- on hardware the Damiao motors tripped their protection
++  // and went limp mid-swing. A motor that never sends a state (e.g. a wrong
++  // CAN ID, or only malformed frames) reads 0 rad and would be yanked the
++  // same way, so activation fails instead.
++  // Refresh, and read until every motor has answered it (or 20 ms passed):
++  // one recv_all() stops at the first quiet moment, with replies in flight.
++  std::array<int64_t, ARM_DOF> before{};
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    before[i] = state_replies(i);
++  }
++  openarm_->refresh_all();
++  const auto deadline =
++      std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
++  for (bool all = false;
++       !all && std::chrono::steady_clock::now() < deadline;) {
++    openarm_->recv_all(500);
++    all = true;
++    for (size_t i = 0; i < ARM_DOF; ++i) {
++      all = all && state_replies(i) > before[i];
++    }
++  }
++  bool replied = true;
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    if (state_replies(i) <= replies[i]) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
++                   "[link %s] joint %zu sent no valid state after enable: not "
++                   "activating (check its power, CAN ID and wiring)",
++                   can_interface_.c_str(), i + 1);
++      replied = false;
++    }
++  }
++  if (!replied) {
++    return false;
++  }
++  const auto& arm_motors = openarm_->get_arm().get_motors();
++  for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
++    pos_states_[i] = arm_motors[i].get_position();
++    pos_commands_[i] = pos_states_[i];
++  }
+   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+-              "Returning to zero position...");
++              "Holding current position on activate (q1=%.3f ... q7=%.3f)",
++              pos_commands_[0], pos_commands_[ARM_DOF - 1]);
+ 
+-  // Return arm to zero with MIT control
++  // Hold the measured pose with MIT control
+   std::vector<openarm::damiao_motor::MITParam> arm_params;
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+-    arm_params.push_back({kp_[i], kd_[i], 0.0, 0.0, 0.0});
++    arm_params.push_back({kp_[i], kd_[i], pos_commands_[i], 0.0, 0.0});
+   }
+   openarm_->get_arm().mit_control_all(arm_params);
+ 
+@@ -578,6 +773,7 @@ void OpenArm_v10HW::return_to_zero() {
+   }
+   std::this_thread::sleep_for(std::chrono::microseconds(1000));
+   openarm_->recv_all();
++  return true;
+ }
+ 
+ // Gripper mapping helper functions

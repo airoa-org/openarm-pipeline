@@ -1,0 +1,14 @@
+gripper:
+  ros__parameters:
+    # One U2D2 for both fingers. This adapter's serial is an example from one rig: set yours from `ls /dev/serial/by-id`.
+    port: /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAO4YS8-if00-port0
+    baudrate: 57600
+    rate_hz: 60.0
+    names: [hand_left_motor_joint, hand_right_motor_joint]
+    ids: [0, 1]
+    offsets_rad: [0.14, 0.12]  # raw angle with the fingers just touching; calibrate per gripper
+    directions: [-1, -1]  # opening is negative raw
+    range_rad: [0.0, 0.7854]  # closed to open, as oap_planner FINGER_CLOSED / FINGER_OPEN
+    goal_current_ma: 1500  # a cap the fingers rarely reach: P and D set the grip
+    position_p_gain: 500  # the default 800 went rigid, then gave at the current cap
+    position_d_gain: 3500

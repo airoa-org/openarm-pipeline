@@ -1,0 +1,20 @@
+# Physical workspace dimensions for this robot, expressed in the `world` frame
+# (= base_link = openarm_body_link0; +z up, +x forward from the pillar).
+
+table:
+  # Height of the table top surface (m) measured from the base plate.
+  top_z: 0.405
+
+  # Table footprint in the world frame (m).
+  x: [0.10, 0.70]
+  y: [-0.55, 0.55]
+  thickness: 0.405  # Table thickness (visualization only).
+
+# Minimum clearance from the robot pillar (m).
+# This value is independent of the end-effector.
+safety_margin: 0.010
+
+# Minimum clearance from the table surface (m).
+# For the gripper as the planner's ellipsoid (trajopt.yaml), which encloses it, so the margin is conservative.
+# Recalibrate if the end-effector or its ellipsoid changes.
+table_margin: 0.007

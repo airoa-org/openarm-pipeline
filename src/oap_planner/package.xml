@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>oap_planner</name>
+  <version>0.1.0</version>
+  <description>Ready / park moves for both OpenArm arms, checked against the table and the pillar</description>
+  <maintainer email="ext-oss@airoa.org">AIRoA</maintainer>
+  <license>Apache-2.0</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>builtin_interfaces</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <!-- plan.py needs pinocchio.casadi, which ros-humble-pinocchio is not known to provide: docker/Dockerfile builds
+       pinocchio 4.0.0 from source against the casadi 3.8.1 wheel -->
+  <exec_depend>pinocchio</exec_depend>
+  <!-- casadi has no rosdep key for the build pinocchio links against (casadi-pip is an unpinned pip wheel):
+       docker/Dockerfile installs casadi==3.8.1 with pip -->
+  <exec_depend>oap_description</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Copyright 2026 AI Robot Association (AIRoA)
+# SPDX-License-Identifier: Apache-2.0
+# The GUI, in the long-running container: ./scripts/gui. Closing it stops nothing; reopening it shows what is still
+# running. OAP_ROS_DOMAIN_ID picks the ROS domain (default 88) when the container starts. oap up builds the image when
+# it is missing or docker/ changed, and recreates a container started from an older docker/.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+# the container runs as root: let only root's local clients onto the display. Failing that, the window cannot open.
+if [ -z "${DISPLAY:-}" ]; then
+  echo "[gui] DISPLAY is not set: start it from the robot PC's desktop session" >&2; exit 1
+fi
+command -v xhost >/dev/null || { echo "[gui] xhost not found: sudo apt install x11-xserver-utils" >&2; exit 1; }
+xhost +SI:localuser:root >/dev/null 2>&1 || { echo "[gui] cannot reach the X display $DISPLAY" >&2; exit 1; }
+ROS_DOMAIN_ID=${OAP_ROS_DOMAIN_ID:-88} "$root/scripts/oap" up
+echo "[gui] building the workspace (about 40 s the first time, a few seconds after)"
+# plain Qt widgets: no OpenGL, which would try the container's Mesa drivers against the host's GPU
+exec "$root/scripts/oap" exec bash -c "colcon build --symlink-install --event-handlers console_cohesion- status- \
+  --cmake-args -Wno-dev || exit 1; . install/setup.bash && echo '[gui] starting the window' \
+  && mkdir -p -m 700 /tmp/runtime-root && XDG_RUNTIME_DIR=/tmp/runtime-root QT_XCB_GL_INTEGRATION=none exec ros2 run oap_gui gui"

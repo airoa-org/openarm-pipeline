@@ -1,0 +1,3 @@
+# The build context: the Dockerfile COPYs only docker/ (patches/ and entrypoint.sh), so everything else stays out.
+*
+!docker/

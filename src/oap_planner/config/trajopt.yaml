@@ -1,0 +1,16 @@
+# oap_planner plan: ready/park trajectory optimization over both arms.
+duration: 10.0      # [s] every move takes this long; chosen default, not measured: slow to watch
+steps: 60           # trajectory samples after the start
+velocity_scale: 0.5 # fraction of the URDF joint velocity limits; heuristic margin, not measured
+smooth_k: 500.0     # [1/m] smooth-max sharpness over the table faces; chosen default, not measured
+
+# One ellipsoid per gripper in <side>_hand_root [m], semi-axes along its x, y, z: the minimum-volume ellipsoid around
+# the gripper (base + camera, fingers fully open). PlanChecker uses it as the gripper too.
+hand_frame: "{side}_hand_root"
+hand_center: [0.017, 0.0, -0.0003]
+hand_semi_axes: [0.082, 0.101, 0.072]
+
+# The pillar as an unbounded vertical cylinder around the column slab of geometry.py's PILLAR_SLABS
+# (x, y within +-0.03 m), so the radius is that square's half-diagonal.
+pillar_axis: [0.0, 0.0]
+pillar_radius: 0.0424

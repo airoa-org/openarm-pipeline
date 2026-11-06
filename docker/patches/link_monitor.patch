@@ -1,0 +1,140 @@
+diff --git a/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp b/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
+index e9406ee..6f2a325 100644
+--- a/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp
+@@ -159,6 +159,16 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
+   static constexpr double RELAX_MAX_KD = 5.0;  // the MIT frame's kd range
+   std::atomic<bool> relax_mode_{false};
+   bool was_relaxed_ = false;  // touched only by write()
++  // AIRoA: link monitor, see monitor_link()
++  void monitor_link();
++  void link_fault(const char* why, size_t joint);
++  int link_fault_cycles_ = 0;
++  std::array<int, ARM_DOF> link_missed_{};
++  std::array<std::chrono::steady_clock::time_point, ARM_DOF> link_seen_{};
++  std::array<bool, ARM_DOF> link_gap_armed_{};
++  std::array<double, ARM_DOF> link_max_gap_ms_{};
++  std::array<uint8_t, ARM_DOF> link_error_{};
++  std::chrono::steady_clock::time_point link_report_{};
+   std::array<std::atomic<double>, ARM_DOF> relax_kd_;
+   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr relax_srv_;
+   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
+diff --git a/openarm_hardware/src/v10_simple_hardware.cpp b/openarm_hardware/src/v10_simple_hardware.cpp
+index 6ab9eb8..35816d2 100644
+--- a/openarm_hardware/src/v10_simple_hardware.cpp
++++ b/openarm_hardware/src/v10_simple_hardware.cpp
+@@ -12,6 +12,8 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++#include <chrono>
++#include <cstdio>
+ #include "openarm_hardware/v10_simple_hardware.hpp"
+ 
+ #include <algorithm>
+@@ -66,6 +68,23 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
+     can_fd_ = (value == "true");
+   }
+ 
++  // AIRoA: 0 = off, see monitor_link()
++  it = info.hardware_parameters.find("link_fault_cycles");
++  if (it != info.hardware_parameters.end()) {
++    size_t n = 0;  // characters parsed: trailing junk fails too
++    try {
++      link_fault_cycles_ = std::stoi(it->second, &n);
++    } catch (const std::exception&) {
++      n = 0;
++    }
++    if (n == 0 || n != it->second.size() || link_fault_cycles_ < 0) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
++                   "link_fault_cycles='%s': needs a whole number >= 0 (0 = off)",
++                   it->second.c_str());
++      return false;
++    }
++  }
++
+   // Parse control gains (AIRoA: a malformed value fails on_init, not throws)
+   for (size_t i = 1; i <= ARM_DOF; ++i) {
+     for (const char* name : {"kp", "kd"}) {
+@@ -494,6 +513,14 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_activate(
+     return CallbackReturn::ERROR;
+   }
+ 
++  // AIRoA: the link monitor counts misses from here (see monitor_link())
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    link_seen_[i] =
++        openarm_->get_arm().get_link_stats(static_cast<int>(i)).last_response;
++    link_missed_[i] = 0;
++    link_gap_armed_[i] = false;
++  }
++
+   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"), "OpenArm V10 activated");
+   return CallbackReturn::SUCCESS;
+ }
+@@ -700,9 +727,66 @@ hardware_interface::return_type OpenArm_v10HW::write(
+         {{GRIPPER_KP, GRIPPER_KD, motor_command, 0, 0}});
+   }
+   openarm_->recv_all(1000);
++  monitor_link();  // AIRoA
+   return hardware_interface::return_type::OK;
+ }
+ 
++// AIRoA: per motor, the longest gap between two replies, reported every 10 s. A motor that misses over link_fault_cycles
++// replies in a row, or reports an error code, relaxes the arm. Cycles, not time: write() pauses ~200 ms while the other
++// arm activates. Misses count from activation, which seeds link_seen_ with each motor's last reply; gaps count from the
++// first reply after it, so the wait for the first write() (the other arm's activation, controller start) is not one.
++void OpenArm_v10HW::monitor_link() {
++  const auto now = std::chrono::steady_clock::now();
++  const auto& motors = openarm_->get_arm().get_motors();
++  for (size_t i = 0; i < ARM_DOF && i < motors.size(); ++i) {
++    const auto last = openarm_->get_arm().get_link_stats(static_cast<int>(i)).last_response;
++    if (last != link_seen_[i]) {
++      if (link_gap_armed_[i]) {
++        link_max_gap_ms_[i] = std::max(link_max_gap_ms_[i],
++                                       std::chrono::duration<double, std::milli>(last - link_seen_[i]).count());
++      }
++      link_gap_armed_[i] = true;
++      link_seen_[i] = last;
++      link_missed_[i] = 0;
++    } else {
++      ++link_missed_[i];
++    }
++    const uint8_t err = motors[i].get_error_code();
++    if (motors[i].has_error() && err != link_error_[i]) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"), "[link %s] joint %zu reports error 0x%X",
++                   can_interface_.c_str(), i + 1, err);
++    }
++    link_error_[i] = err;
++    if (motors[i].has_error()) {
++      link_fault("an error code", i);
++    } else if (link_fault_cycles_ > 0 && link_missed_[i] > link_fault_cycles_) {
++      link_fault("no reply", i);
++    }
++  }
++  if (link_report_.time_since_epoch().count() == 0) {
++    link_report_ = now;
++  } else if (now - link_report_ > std::chrono::seconds(10)) {
++    char line[160];
++    int n = 0;
++    for (size_t i = 0; i < ARM_DOF; ++i) {
++      n += std::snprintf(line + n, sizeof(line) - n, " %.1f", link_max_gap_ms_[i]);
++      link_max_gap_ms_[i] = 0.0;
++    }
++    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"), "[link %s] longest reply gap j1-j7 [ms]:%s",
++                can_interface_.c_str(), line);
++    link_report_ = now;
++  }
++}
++
++// motion trips once the relaxed arm sinks; relax OFF re-arms the check.
++void OpenArm_v10HW::link_fault(const char* why, size_t joint) {
++  if (relax_mode_.exchange(true)) {
++    return;
++  }
++  RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"), "[link %s] joint %zu: %s, relax ON", can_interface_.c_str(),
++               joint + 1, why);
++}
++
+ // AIRoA: replies to arm motor i that carried a state it could parse. The
+ // library counts every frame routed to a motor as a response before parsing
+ // it, and a frame that fails the parse also as malformed: such a reply leaves

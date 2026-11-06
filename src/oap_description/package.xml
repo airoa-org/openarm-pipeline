@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>oap_description</name>
+  <version>0.1.0</version>
+  <description>Bimanual OpenArm v1.0 URDF with a hand frame on each arm, as one flat URDF file</description>
+  <maintainer email="ext-oss@airoa.org">AIRoA</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>openarm_description</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

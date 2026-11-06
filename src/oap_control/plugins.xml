@@ -1,0 +1,10 @@
+<library path="oap_control">
+  <class name="oap_control/Motion" type="oap_control::Motion"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>Hand pose chunks → spline → one IK step per update, or planner paths → q, q̇, q̈ references for both arms</description>
+  </class>
+  <class name="oap_control/TorqueFeedforwardController" type="oap_control::TorqueFeedforwardController"
+         base_class_type="controller_interface::ChainableControllerInterface">
+    <description>One arm's torque feedforward under motion</description>
+  </class>
+</library>

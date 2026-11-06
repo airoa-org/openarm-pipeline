@@ -1,0 +1,58 @@
+openarm-pipeline
+Copyright 2026 AI Robot Association (AIRoA)
+
+This product includes software and assets developed by third parties, listed
+below with their licenses.
+
+-------------------------------------------------------------------------------
+docker/patches/*.patch
+
+Modifications to openarm_ros2 0.9.2 (openarm_hardware), applied at image
+build time.
+  https://github.com/enactic/openarm_ros2
+  Copyright 2025 Enactic, Inc.
+  License: Apache License 2.0 (see LICENSE)
+
+-------------------------------------------------------------------------------
+src/oap_description/urdf/openarm_bimanual.urdf
+
+The arm and body parts are derived from the OpenArm v1.0 description
+(kinematics, limits, inertials), flattened from xacro, with a hand frame on
+each arm's last link. Its arm and body meshes are not copied here: the URDF
+refers to package://openarm_description/..., which the image builds from
+upstream.
+  https://github.com/enactic/openarm_description
+  Copyright 2025 Enactic, Inc.
+  License: Apache License 2.0 (see LICENSE)
+
+-------------------------------------------------------------------------------
+policy/airoa0_inference/flash_sampler.py
+
+Derived from openpi revision 215abfb as vendored in AIRoA-0 at ab9c7ec
+(openpi.models.pi0), developed by Physical Intelligence; modified by AIRoA.
+  https://github.com/Physical-Intelligence/openpi
+  License: Apache License 2.0 (see LICENSE)
+
+-------------------------------------------------------------------------------
+Dependencies fetched at build time (not included in this repository)
+
+docker/Dockerfile downloads its dependencies from upstream when the image is
+built, and scripts/serve_policy.sh those of the policy server when it first
+starts; they are used under their own licenses. Notably:
+  AIRoA-0 (airoa-org)                           Apache License 2.0
+  openarm_ros2 0.9.2 (enactic)                  Apache License 2.0
+  openarm_description 1.0.4 (enactic)           Apache License 2.0
+  openarm_can (enactic)                         Apache License 2.0
+  pinocchio (stack-of-tasks)                    BSD 2-Clause
+  coal (coal-library)                           BSD 3-Clause
+  casadi                                        LGPL-3.0-or-later
+  dynamixel_sdk (ROBOTIS)                       Apache License 2.0
+  PyQt5 (Riverbank Computing)                   GPL-3.0
+
+The AIRoA-0 checkpoints the policy server loads are Gemma Model Derivatives:
+their use is subject to the Gemma Terms of Use (ai.google.dev/gemma/terms) and
+the Gemma Prohibited Use Policy (ai.google.dev/gemma/prohibited_use_policy).
+
+oap_gui imports PyQt5 (GPL-3.0). This repository's code stays under Apache-2.0,
+which is compatible with GPL-3.0; a redistributed image or binary that bundles
+PyQt5 with oap_gui is subject to the GPL-3.0.

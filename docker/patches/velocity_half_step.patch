@@ -1,0 +1,15 @@
+diff --git a/openarm_hardware/src/v10_simple_hardware.cpp b/openarm_hardware/src/v10_simple_hardware.cpp
+index 0b34117..6ab9eb8 100644
+--- a/openarm_hardware/src/v10_simple_hardware.cpp
++++ b/openarm_hardware/src/v10_simple_hardware.cpp
+@@ -647,7 +647,9 @@ hardware_interface::return_type OpenArm_v10HW::read(
+   const auto& arm_motors = openarm_->get_arm().get_motors();
+   for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
+     pos_states_[i] = arm_motors[i].get_position();
+-    vel_states_[i] = arm_motors[i].get_velocity();
++    // AIRoA: the DM encoder truncates the 12-bit velocity, so it reads vMax/4095 low (-0.011 rad/s at rest on a DM8009).
++    vel_states_[i] = arm_motors[i].get_velocity() +
++                     openarm::damiao_motor::Motor::get_limit_param(arm_motors[i].get_motor_type()).vMax / 4095.0;
+     tau_states_[i] = arm_motors[i].get_torque();
+   }
+ 

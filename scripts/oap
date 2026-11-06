@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# Copyright 2026 AI Robot Association (AIRoA)
+# SPDX-License-Identifier: Apache-2.0
+# ./scripts/oap build [docker build args] | up | exec <cmd> | shell | down [--force] | run <cmd> | test
+#   build: extra args go to docker build, e.g. ./scripts/oap build --no-cache. OAP_BUILD_ARGS, split on whitespace, goes
+#       to every build, including those up and run start, e.g. export OAP_BUILD_ARGS="--build-arg CMEEL_JOBS=4": a build
+#       arg passed to one build only would rebuild the layers it changes on the next. The heavy part,
+#       docker/base.Dockerfile, builds first as openarm-pipeline-base:$USER (cached: seconds), with the same args,
+#       unless OAP_BASE_IMAGE names a base to build FROM (one built elsewhere, e.g. pulled by digest): the
+#       base's args (ROS_SNAPSHOT, PINOCCHIO_VERSION, OPENARM_CAN_REF, CMEEL_JOBS) then do nothing, and a base labelled
+#       with another oap.base-hash than the checkout's is a warning, and with CI=true an error.
+#   up: start the long-running container openarm-pipeline-$USER, where the GUI and everything it starts live, so they
+#       outlast a closed GUI; down stops it and everything in it. run: a throwaway container (tests).
+#   up and run build the image first when it is missing or was built from another docker/ (its hash is the image's
+#   oap.docker-hash label), and up recreates a container started from another docker/ unless control runs in it (or
+#   that could not be checked). shell enters the running container as it is. down asks before it stops a running
+#   control (the arms go limp), or one it could not check (e.g. a paused container); without a terminal it needs
+#   --force or OAP_FORCE=1.
+#   test: colcon build -Werror, pytest and the oap_control gtests in a throwaway container with no host network and
+#       no devices, into .cache/test/ (never build/ or install/); a skipped test fails it. What to run before a PR.
+# ROS_DOMAIN_ID must be set for up and run: a mismatch hides every topic without an error.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+image=openarm-pipeline:${USER}
+name=openarm-pipeline-${USER}
+
+# The hash of files under docker/ (path, content and which are executable, the mode git keeps: the rest follows the
+# checkout's umask): an image or container labelled with another one is stale. docker_hash: all of docker/, and
+# OAP_BASE_IMAGE; base_hash: what docker/base.Dockerfile uses (its oap.base-hash label).
+hash_files() {  # hash_files <path>... (relative to the repository root)
+  (cd "$root" && find "$@" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum \
+    && find "$@" -type f -perm -u+x | LC_ALL=C sort) | sha256sum | cut -c1-16
+}
+docker_hash() { printf '%s %s\n' "$(hash_files docker)" "${OAP_BASE_IMAGE:-}" | sha256sum | cut -c1-16; }
+base_hash() { hash_files docker/base.Dockerfile docker/base-constraints.txt docker/ros-snapshots.asc; }
+label() {  # label <type> <name> [<label>]
+  docker inspect --type "$1" -f "{{index .Config.Labels \"${3:-oap.docker-hash}\"}}" "$2" 2>/dev/null || true
+}
+# The base (docker/base.Dockerfile, the heavy part) builds locally as openarm-pipeline-base:$USER on every build, so
+# that build args reach it (cached, it takes seconds), unless OAP_BASE_IMAGE names one to use instead (e.g. one
+# pulled by digest). build's own args (oap build --no-cache) and OAP_BUILD_ARGS go to both builds.
+base_image=openarm-pipeline-base:${USER}
+build() {
+  local extra=() base=${OAP_BASE_IMAGE:-$base_image}
+  read -ra extra <<< "${OAP_BUILD_ARGS:-}"
+  if [ -z "${OAP_BASE_IMAGE:-}" ]; then
+    if ! docker image inspect "$base_image" >/dev/null 2>&1; then
+      echo "[oap] no $base_image image yet: building it once (15 minutes or more, over an hour on 2 cores:" \
+        "pinocchio compiles from source)"
+    fi
+    docker build --label "oap.base-hash=$(base_hash)" -t "$base_image" -f "$root/docker/base.Dockerfile" \
+      "${extra[@]}" "$@" "$root"
+  else  # built elsewhere, labelled with the base_hash of the docker/ it was built from
+    docker image inspect "$base" >/dev/null 2>&1 || docker pull -q "$base" >/dev/null
+    local have; have=$(label image "$base" oap.base-hash)
+    if [ "$have" != "$(base_hash)" ]; then
+      echo "[oap] OAP_BASE_IMAGE $base was built from another docker/base.Dockerfile, base-constraints.txt or" \
+        "ros-snapshots.asc (oap.base-hash ${have:-missing}, here $(base_hash)): rebuild it, or unset OAP_BASE_IMAGE" >&2
+      if [ "${CI:-}" = true ]; then exit 1; fi  # CI tests what the checkout builds
+    fi
+  fi
+  docker build --label "oap.docker-hash=$(docker_hash)" --build-arg "BASE_IMAGE=$base" -t "$image" \
+    -f "$root/docker/Dockerfile" "${extra[@]}" "$@" "$root"
+}
+ensure_image() {
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    echo "[oap] no $image image yet: building it once"
+  elif [ "$(label image "$image")" != "$(docker_hash)" ]; then
+    echo "[oap] docker/ changed since $image was built: rebuilding it"
+  else
+    return 0
+  fi
+  build
+}
+
+run_args=()
+set_run_args() {  # checkpoints/: the policy bundles (gitignored; a link to where they live is fine). --gpus: the policy server
+  mkdir -p "$root/checkpoints"
+  local runtimes
+  runtimes=$(docker info --format '{{json .Runtimes}}' 2>/dev/null || true)
+  run_args=(--network host --privileged -v /dev:/dev -e ROS_DOMAIN_ID -v "$root:/ws"
+    -v "$(readlink -f "$root/checkpoints"):/checkpoints"
+    -e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -e QT_X11_NO_MITSHM=1)  # X for the GUI (scripts/gui runs xhost)
+  if [[ $runtimes == *'"nvidia"'* ]]; then run_args+=(--gpus all); fi
+}
+running() { [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ]; }
+domain() { docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$name" | sed -n 's/^ROS_DOMAIN_ID=//p'; }
+# oap test: colcon build with -Werror, pytest, the oap_control gtests; expanded in the container
+# shellcheck disable=SC2016
+test_sh='set -e
+dirs=(--build-base .cache/test/build --install-base .cache/test/install)
+colcon build "${dirs[@]}" --event-handlers console_direct- --cmake-args -DCMAKE_CXX_FLAGS=-Werror
+pip3 install -q --no-cache-dir pytest==8.3.5 pytest-timeout==2.3.1
+source .cache/test/install/setup.bash
+python3 -m pytest -p no:cacheprovider -rs --timeout=120 tests/
+colcon test "${dirs[@]}" --packages-select oap_control --event-handlers console_direct- --return-code-on-test-failure \
+  || rc=$?
+colcon test-result --test-result-base .cache/test/build --verbose
+exit "${rc:-0}"'
+tty=(); if [ -t 0 ]; then tty=(-t); fi  # -t only from a terminal: without one (CI, scripts) docker refuses it
+
+# Run in the container (bash -c "$procs_sh" procs alive <name> | control | stop [keep-control]): the GUI starts each
+# process in its own session and keeps its pid, which is also its process group, in /tmp/oap/<name>.pid and
+# "<pid> <start time>" (field 22 of /proc/<pid>/stat; older GUIs wrote none) in /tmp/oap/<name>.start. stop signals
+# every group but control's (SIGINT; SIGTERM to move) and waits 5 s for them, then stops control (stop_control), so
+# ros2_control deactivates the arms instead of being SIGKILLed with the container. Control is the GUI's control group
+# and also any control chain started by hand in the container (oap exec / oap shell: no pid file): a `ros2 launch` of
+# oap_control, or a ros2_control_node. control exits 0 while control runs and 10 when it does not (any other code:
+# not checked, e.g. a paused container); stop keep-control signals nothing and exits 3 when control runs.
+procs_sh=$(cat <<'EOF'
+pgid() {  # the process group of /tmp/oap/$1.pid, unless it is gone or its pid was reused (another start time)
+  local f=/tmp/oap/$1.pid p='' sp='' t='' st
+  [ -r "$f" ] || return 1
+  read -r p _ 2>/dev/null < "$f" || true
+  [[ $p =~ ^[0-9]+$ ]] || return 1
+  if [ -r "/tmp/oap/$1.start" ]; then read -r sp t _ 2>/dev/null < "/tmp/oap/$1.start" || true; fi
+  [ "$sp" = "$p" ] || t=''  # a .start for another pid (or in another format) says nothing about this one
+  if [ -n "$t" ] && st=$(cat "/proc/$p/stat" 2>/dev/null); then  # a gone leader: its group decides, as in the GUI
+    read -ra st <<< "${st##*) }"  # the fields from 3 on: the name before them may contain spaces
+    [ "${st[19]}" = "$t" ] || return 1
+  fi
+  kill -0 -- "-$p" 2>/dev/null || return 1
+  echo "$p"
+}
+alive() { pgid "$1" >/dev/null; }
+wait_gone() {  # wait_gone <timeout s> <name>...: fails, naming the ones left, if any outlives it
+  local end=$((SECONDS + $1 + 1)) n rest=(); shift  # +1: SECONDS counts whole seconds, so at least $1 s
+  while :; do
+    rest=(); for n in "$@"; do alive "$n" && rest+=("$n"); done
+    [ ${#rest[@]} -eq 0 ] && return 0
+    [ "$SECONDS" -lt "$end" ] || break
+    sleep 0.1
+  done
+  echo "${rest[*]}"; return 1
+}
+stop() {  # stop <timeout s> <name>...: a signal to each whole group, as the GUI's Stop: SIGINT, but SIGTERM to move,
+  # where SIGINT makes a circle ramp out with more chunks
+  local t=$1 n s left=() rest; shift
+  for n in "$@"; do
+    s=INT; [ "$n" = move ] && s=TERM
+    alive "$n" && { kill -"$s" -- "-$(pgid "$n")" 2>/dev/null || true; left+=("$n"); }
+  done
+  [ ${#left[@]} -gt 0 ] || return 0
+  echo "[oap] stopping ${left[*]}"
+  rest=$(wait_gone "$t" "${left[@]}") || echo "[oap] still running after $t s, killed with the container: $rest" >&2
+}
+is_launch() {  # the argv in a[] is `ros2 launch ...`, run directly or by an interpreter, by the GUI's rule (is_launch):
+  # skip argv[0] unless it is ros2 itself, then the interpreter's - options, then require basename ros2, then launch
+  local i=1
+  [ "${a[0]##*/}" = ros2 ] && i=0
+  while [[ ${a[i]:-} == -* ]]; do i=$((i + 1)); done
+  [ -n "${a[i]:-}" ] && [ "${a[i]##*/}" = ros2 ] && [ "${a[i + 1]:-}" = launch ]
+}
+scan() {  # sets launches ("pid:pgid:1 if of oap_control") and nodes ("pid:parent" of each ros2_control_node)
+  local d p st x ctl
+  launches=(); nodes=()
+  for d in /proc/[0-9]*; do
+    p=${d#/proc/}
+    mapfile -d '' a 2>/dev/null < "$d/cmdline" || continue  # 2> first: a process gone meanwhile fails the <
+    [ ${#a[@]} -gt 0 ] || continue
+    read -r st 2>/dev/null < "$d/stat" || continue
+    read -ra st <<< "${st##*) }"  # [1]: field 4, the parent; [2]: field 5, the process group
+    if is_launch; then
+      ctl=0; for x in "${a[@]}"; do [ "$x" = oap_control ] && ctl=1; done
+      launches+=("$p:${st[2]}:$ctl")
+    elif [ "${a[0]##*/}" = ros2_control_node ]; then
+      nodes+=("$p:${st[1]}")
+    fi
+  done
+}
+control_targets() {  # sets targets, what to SIGINT once for control: the launch in the GUI's control group (that
+  # group, as -pgid, when it has none), every other launch of oap_control, and each ros2_control_node none of them
+  # started; group: the GUI's control group, as -pgid
+  local g e pid grp ctl n ppid found=0 ours=" "
+  targets=(); group=''
+  g=$(pgid control) || g=''
+  scan
+  for e in "${launches[@]}"; do
+    IFS=: read -r pid grp ctl <<< "$e"
+    if [ -n "$g" ] && [ "$grp" = "$g" ]; then found=1; elif [ "$ctl" != 1 ]; then continue; fi
+    targets+=("$pid"); ours+="$pid "
+  done
+  if [ -n "$g" ]; then group=-$g; [ "$found" = 1 ] || targets+=("$group"); fi
+  for e in "${nodes[@]}"; do
+    IFS=: read -r n ppid <<< "$e"
+    [[ $ours == *" $ppid "* ]] || targets+=("$n")
+  done
+}
+control_alive() { control_targets; [ ${#targets[@]} -gt 0 ]; }
+stop_control() {  # SIGINT once to each launch: it forwards one SIGINT to each node and escalates on its own timeouts
+  # (ros2_control_node: SIGTERM after 20 s, SIGKILL 10 s later). It forwards SIGINT only when noninteractive, as the
+  # GUI starts it (--noninteractive, stdin not a terminal; so does oap exec without a terminal). SIGINT to the whole
+  # group would reach ros2_control_node twice, and a second one can kill it before it has deactivated the hardware.
+  # What still runs after 35 s gets SIGTERM (the GUI's control group as a whole), then SIGKILL 5 s later.
+  local x sig wait end all
+  control_alive || return 0
+  all=("${targets[@]}")
+  echo "[oap] stopping control (SIGINT to ${all[*]})"
+  for x in "${all[@]}"; do kill -INT -- "$x" 2>/dev/null || true; done
+  for sig in TERM KILL; do
+    if [ "$sig" = TERM ]; then wait=35; else wait=5; fi
+    end=$((SECONDS + wait + 1))  # at least $wait s (SECONDS counts whole seconds)
+    while control_alive; do [ "$SECONDS" -lt "$end" ] || break; sleep 0.1; done
+    [ ${#targets[@]} -gt 0 ] || return 0
+    echo "[oap] control still running after $wait s: SIG$sig" >&2
+    for x in "${targets[@]}" $group; do kill -"$sig" -- "$x" 2>/dev/null || true; done
+  done
+}
+case $1 in
+  alive) alive "$2" ;;
+  control) control_alive || exit 10 ;;
+  stop)
+    if [ "${2:-}" = keep-control ] && control_alive; then exit 3; fi
+    names=()
+    for f in /tmp/oap/*.pid; do
+      [ -e "$f" ] || continue
+      n=${f##*/}; n=${n%.pid}
+      [ "$n" = control ] || names+=("$n")
+    done
+    stop 5 "${names[@]}"
+    if [ "${2:-}" = keep-control ]; then control_alive && exit 3; exit 0; fi  # control started meanwhile: still kept
+    stop_control ;;
+esac
+EOF
+)
+procs() { docker exec "$name" bash -c "$procs_sh" procs "$@"; }
+control_state() {  # 0: control runs, 1: it does not (or no running container), 2: could not check (paused, exec failed)
+  local rc=0
+  running || return 1
+  procs control || rc=$?
+  case $rc in 0) return 0 ;; 10) return 1 ;; *) return 2 ;; esac
+}
+remove() {  # stop what runs in the container, then remove it; a failing docker rm shows
+  if running; then procs stop || true; fi
+  if docker container inspect "$name" >/dev/null 2>&1; then docker rm -f "$name" >/dev/null; fi
+}
+domain_differs() { [ -n "${ROS_DOMAIN_ID:-}" ] && [ "$(domain)" != "$ROS_DOMAIN_ID" ]; }
+fresh() { [ "$(label container "$name")" = "$(docker_hash)" ]; }
+
+cmd=${1:-}
+case $cmd in
+  build) shift; build "$@" ;;
+  up)
+    if running && domain_differs; then
+      echo "[oap] $name runs on ROS_DOMAIN_ID=$(domain), not $ROS_DOMAIN_ID. Use $(domain) (scripts/gui:" \
+           "OAP_ROS_DOMAIN_ID=$(domain)), or recreate it with ./scripts/oap down first (it stops what runs in it)." >&2
+      exit 1
+    fi
+    running && fresh && exit 0
+    : "${ROS_DOMAIN_ID:?set ROS_DOMAIN_ID}"
+    ensure_image  # may take minutes: what runs in the container is checked after it, right before the container goes
+    if running; then
+      fresh && exit 0
+      # keep-control: never stop a running control from here; it SIGINTs the rest only if control is not running
+      rc=0; procs stop keep-control || rc=$?
+      if [ "$rc" != 0 ]; then  # 3: control runs; anything else: what runs in it was not checked
+        why="control is running"; [ "$rc" = 3 ] || why="what runs in it could not be checked (rc $rc)"
+        echo "[oap] $name was started from another docker/, but $why: keeping it." \
+             "Recreate it with ./scripts/oap down && ./scripts/oap up once the arms are parked." >&2
+        exit 0
+      fi
+      echo "[oap] $name was started from another docker/: recreating it"
+    fi
+    if docker container inspect "$name" >/dev/null 2>&1; then docker rm -f "$name" >/dev/null; fi
+    set_run_args
+    # --init: a process the GUI started is reaped when it ends, after that GUI has closed
+    exec docker run -d --init --name "$name" "${run_args[@]}" "$image" sleep infinity >/dev/null ;;
+  exec) shift; running || { echo "$name is not running: ./scripts/oap up" >&2; exit 1; }
+    exec docker exec -i "${tty[@]}" -e DISPLAY -e OAP_LEFT_CAN -e OAP_RIGHT_CAN "$name" /entrypoint.sh "$@" ;;
+  shell)  # into the running container as it is; only up (and scripts/gui) recreate it
+    if running; then
+      fresh || echo "[oap] note: $name was started from another docker/; ./scripts/oap up recreates it" >&2
+      if domain_differs; then echo "[oap] note: $name runs on ROS_DOMAIN_ID=$(domain), not $ROS_DOMAIN_ID" >&2; fi
+    else
+      "$0" up
+    fi
+    exec docker exec -it "$name" /entrypoint.sh bash ;;
+  down) shift  # an unreachable daemon (not in the docker group, dockerd down) would read as no container: fail
+    docker version >/dev/null || { echo "[oap] cannot reach docker: $name and control left as they are" >&2; exit 1; }
+    st=1; if [ "${1:-}" != --force ] && [ "${OAP_FORCE:-}" != 1 ]; then st=0; control_state || st=$?; fi
+    if [ "$st" != 1 ]; then  # fail closed: a control that could not be checked counts as running
+      why="control is running"; [ "$st" = 0 ] || why="could not check whether control runs in $name (paused?)"
+      if [ -t 0 ]; then
+        read -rp "[oap] $why: the arms go limp. Are they parked? [y/N] " answer
+        [[ $answer == [yY]* ]] || { echo "[oap] kept $name" >&2; exit 1; }
+      else
+        echo "[oap] $why: stopping it makes the arms go limp. Once they are parked:" \
+             "./scripts/oap down --force (or OAP_FORCE=1)" >&2
+        exit 1
+      fi
+    fi
+    remove ;;
+  run) shift; : "${ROS_DOMAIN_ID:?set ROS_DOMAIN_ID}"
+    ensure_image
+    set_run_args
+    exec docker run --rm -i "${tty[@]}" "${run_args[@]}" "$image" "$@" ;;
+  test) shift; ensure_image
+    # what CI would run, in a throwaway container: no host network (DDS stays inside it), no devices; builds into
+    # .cache/test/ so it never touches build/ and install/ of a running bring-up; a skipped test fails the run
+    exec docker run --rm -i "${tty[@]}" -v "$root:/ws" -w /ws -e ROS_LOCALHOST_ONLY=1 -e OAP_TESTS_NO_SKIP=1 -e PYTHONDONTWRITEBYTECODE=1 \
+      -e COLCON_LOG_PATH=/ws/.cache/test/log "$image" bash -c "$test_sh" ;;
+  *) echo "usage: $0 build [docker build args] | up | exec <cmd> | shell | down [--force] | run <cmd> | test" >&2
+     echo "  OAP_BUILD_ARGS: docker build args for every build, e.g. \"--build-arg CMEEL_JOBS=4\"" >&2; exit 1 ;;
+esac
